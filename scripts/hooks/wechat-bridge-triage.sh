@@ -10,6 +10,10 @@
 # recovery at ~5 s instead of a full agent turn (~30-60 s), and avoids the
 # old failure mode where a hook worker's own restart was reaped with its
 # turn.
+#
+# Heartbeat: the daemon writes state/cursor.txt on every successful poll
+# (every ~30-70 s). A live process with a stale heartbeat is stuck, not
+# healthy — this script kills it so the supervisor restarts it in 2 s.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -36,7 +40,32 @@ if [ -e "$BRIDGE/state/flags/session_expired" ]; then
   wake "微信桥登录过期，需要重新扫码" '{"health": "session_expired"}'
 fi
 
+daemon_pid() { pgrep -f 'python .*daemon\.py$' | head -1; }
+
 if daemon_alive; then
+  # Heartbeat check: cursor.txt is written on every successful poll.
+  # Stale heartbeat + live process = stuck daemon, not a healthy one.
+  # Age guard: a freshly (re)started daemon needs up to ~70 s for its
+  # first poll to write the cursor — never kill one younger than 100 s,
+  # or the restart itself becomes a kill loop.
+  stale=0
+  pid=$(daemon_pid)
+  age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+  if [ -n "$age" ] && [ "$age" -gt 100 ]; then
+    if [ ! -e "$BRIDGE/state/cursor.txt" ]; then
+      stale=1
+    elif [ -z "$(find "$BRIDGE/state/cursor.txt" -mmin -3 2>/dev/null)" ]; then
+      stale=1
+    fi
+  fi
+  if [ "$stale" = 1 ]; then
+    pid=$(daemon_pid)
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null || true
+      log "observation" "{\"action\":\"killed_stuck_daemon\",\"pid\":$pid}"
+    fi
+    silent "微信桥 daemon 心跳停了，已杀掉，supervisor 2 秒内重启"
+  fi
   rm -f "$MARK"
   silent "微信桥正常，收件箱为空"
 fi

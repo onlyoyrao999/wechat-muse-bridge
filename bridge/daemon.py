@@ -128,6 +128,7 @@ class Bridge:
         self.typing_on: set[str] = set()
         self.recent: dict[tuple[str, str], float] = {}
         self.send_attempts: dict[str, int] = {}  # outbox filename -> failed send count
+        self.send_cache: dict[str, dict] = {}  # outbox filename -> built msgs/upload ref (reused on retry so a retry resends the identical payload, same client_id)
         self.lock = threading.Lock()
 
     # -- helpers --
@@ -237,23 +238,45 @@ class Bridge:
         self.send_attempts[path.name] = n
         return n >= 2
 
-    def send_media(self, user_id: str, ct: str, media_file: Path, caption: str) -> None:
+    def send_media(self, user_id: str, ct: str, media_file: Path, caption: str,
+                   cache: dict | None = None) -> None:
         """Upload-then-send one media file with an optional caption.
 
         Upload happens first (invisible to the user if it fails), then the
         caption chunks, then the media message itself.
+
+        `cache` (per outbox job, kept by the caller) holds the upload ref
+        and the built messages, so a retry re-sends the *identical* payload
+        (same client_id) instead of building a brand-new message: if the
+        first attempt actually reached the server but its reply was lost
+        ("Remote end closed connection"), the retry is a server-side dedup,
+        not a second copy in WeChat. Caption chunks already sent are not
+        re-sent on retry (progress kept in cache["caption_sent"]).
         """
+        cache = cache if cache is not None else {}
         data = media_file.read_bytes()
         if len(data) > wxmedia.MAX_MEDIA_BYTES:
             raise ValueError(f"media file over 100MB cap: {media_file}")
         item_type = wxmedia.media_type_from_path(str(media_file))
-        param, key_b64, cipher_size = wxmedia.upload_media(
-            self.base_url, self.token, user_id, data, item_type)
+        if "upload" not in cache:
+            param, key_b64, cipher_size = wxmedia.upload_media(
+                self.base_url, self.token, user_id, data, item_type)
+            cache["upload"] = (param, key_b64, cipher_size)
+        param, key_b64, cipher_size = cache["upload"]
         ref = {"encrypt_query_param": param, "aes_key": key_b64, "encrypt_type": 1}
-        for chunk in chunk_text(caption) if caption else []:
-            self.send_msg(user_id, ct, ilink.build_text_message(user_id, ct, chunk))
-        self.send_msg(user_id, ct, ilink.build_media_message(
-            user_id, ct, item_type, ref, cipher_size, media_file.name, len(data)))
+        if "caption_msgs" not in cache:
+            cache["caption_msgs"] = [
+                ilink.build_text_message(user_id, ct, chunk)
+                for chunk in chunk_text(caption)] if caption else []
+        if "media_msg" not in cache:
+            cache["media_msg"] = ilink.build_media_message(
+                user_id, ct, item_type, ref, cipher_size, media_file.name, len(data))
+        sent = cache.get("caption_sent", 0)
+        for msg in cache["caption_msgs"][sent:]:
+            self.send_msg(user_id, ct, msg)
+            sent += 1
+            cache["caption_sent"] = sent
+        self.send_msg(user_id, ct, cache["media_msg"])
 
     def session_dead(self, where: str) -> None:
         log.error("SESSION EXPIRED at %s — flagging and exiting clean", where)
@@ -329,14 +352,25 @@ class Bridge:
                         log.error("no context_token for %s — keep queued", user_id)
                         continue
                     try:
+                        cache = self.send_cache.setdefault(path.name, {})
                         if media_file is not None:
-                            self.send_media(user_id, ct, media_file, text)
+                            self.send_media(user_id, ct, media_file, text, cache)
                         else:
-                            for chunk in chunk_text(text):
-                                self.send_msg(user_id, ct,
-                                              ilink.build_text_message(user_id, ct, chunk))
+                            # Build the chunk messages once per job: a retry
+                            # must resend the identical payload (same
+                            # client_id), not a brand-new message.
+                            if "text_msgs" not in cache:
+                                cache["text_msgs"] = [
+                                    ilink.build_text_message(user_id, ct, chunk)
+                                    for chunk in chunk_text(text)]
+                            sent = cache.get("text_sent", 0)
+                            for msg in cache["text_msgs"][sent:]:
+                                self.send_msg(user_id, ct, msg)
+                                sent += 1
+                                cache["text_sent"] = sent
                         path.unlink()
                         self.send_attempts.pop(path.name, None)
+                        self.send_cache.pop(path.name, None)
                         log.info("outbox -> %s (%d chars%s) sent", user_id, len(text),
                                  " + media" if media_file is not None else "")
                     except ValueError as e:
@@ -349,6 +383,7 @@ class Bridge:
                             log.error("send failed twice, drop job %s: %s", path.name, e)
                             path.unlink(missing_ok=True)
                             self.send_attempts.pop(path.name, None)
+                            self.send_cache.pop(path.name, None)
                         else:
                             log.error("send failed, keep queued for one retry: %s", e)
                             time.sleep(5)
@@ -357,6 +392,7 @@ class Bridge:
                             log.error("send error twice, drop job %s: %r", path.name, e)
                             path.unlink(missing_ok=True)
                             self.send_attempts.pop(path.name, None)
+                            self.send_cache.pop(path.name, None)
                         else:
                             log.error("send error, keep queued for one retry: %r", e)
                             time.sleep(5)

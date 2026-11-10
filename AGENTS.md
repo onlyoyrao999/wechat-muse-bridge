@@ -22,6 +22,10 @@
 `scripts/install.sh` → `scripts/official_login.py`（扫码）→
 `scripts/connect_muse.py`（接进桥、起 daemon）→ 装 hook
 （`scripts/hooks/wechat-bridge-triage.sh` + `triage-prompt.md`，见 README）。
+daemon 永远由 `scripts/supervise-daemon.sh` 托管，不要直接起 daemon，
+更不要让 hook worker 去起——worker turn 结束时它的进程组会被回收，
+连带杀掉 daemon（2026-11-10 实测：worker 起的 daemon 每活约 2 分钟
+就悄悄消失；setsid 起的活了 5 分钟以上）。
 
 ## 分拣契约
 

@@ -52,3 +52,13 @@
 8. **用户必须先发消息**。微信的 context_token 机制：机器人不能主动
    发起会话，首条消息必须由用户发；`allowed_users` 留空时首个发信人
    自动配对锁定白名单。
+9. **daemon 会悄悄死，supervisor 兜底**。2026-11-10 晚，hook worker
+   起的 daemon 每活约 2 分钟就无声消失，日志里没有任何报错和退出记录；
+   同一天主 Agent 用 setsid 起的 daemon 活了 5 分钟以上没死。最可能的
+   解释：worker 的进程组在 turn 结束时被回收，连带杀掉了它起的 daemon。
+   对策：daemon 永远由 `supervise-daemon.sh` 托管（setsid 脱离会话，
+   死了 2 秒内重启，退出码记日志）；hook 脚本只在 supervisor 不见了
+   时才拉起 supervisor，不再让 Agent 直接起 daemon。实测：手动杀掉
+   daemon 后约 2 秒恢复，退出码 143（SIGTERM）正确记入
+   `logs/supervisor.log`。另外注意：重启命令用 `>>` 追加日志，不要
+   用 `>`——`>` 会把上一次死亡的 traceback 截掉，让死因永远查不出来。

@@ -30,9 +30,52 @@ mkdir -p "$HOME/hooks/state"
 daemon_alive() { pgrep -f 'python .*daemon\.py$' >/dev/null 2>&1; }
 supervisor_alive() { pgrep -f 'supervise-daemon\.sh$' >/dev/null 2>&1; }
 
-count=$(find "$BRIDGE/inbox" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
-if [ "$count" -gt 0 ]; then
-  wake "微信有 $count 条新消息" "{\"count\": $count}"
+# Dedup: wake at most once per inbox message. The poll runs every 5 s
+# and a worker can take 30-60 s (e.g. generating an image), so without
+# this the same message wakes a new worker every 5 s and each one writes
+# its own reply -> the same image/text sent twice or three times
+# (seen 2026-11-10 19:55: "行，再来一张。" woke 10 workers). One marker
+# file per message id; a marker expires after 10 min so a message whose
+# worker died still gets re-woken. A worker claims a message by moving it
+# to state/processing/ first; if it dies there, the sweep below puts it
+# back in inbox/ after 10 min.
+WOKEN_DIR="$HOME/hooks/state/wechat-bridge-woken"
+mkdir -p "$WOKEN_DIR" "$BRIDGE/state/processing"
+if [[ "$HATCH_HOOK_DRY_RUN" != "1" ]]; then
+  for f in "$BRIDGE/state/processing"/*.json; do
+    [ -e "$f" ] || continue
+    if [ -n "$(find "$f" -mmin +10 2>/dev/null)" ]; then
+      mv "$f" "$BRIDGE/inbox/" 2>/dev/null || true
+      log "observation" '{"action":"requeued_stale_processing"}'
+    fi
+  done
+fi
+new=0
+for f in "$BRIDGE/inbox"/*.json; do
+  [ -e "$f" ] || continue
+  id=$(basename "$f" .json | sed 's/^[0-9]*-//')
+  marker="$WOKEN_DIR/$id"
+  if [ -e "$marker" ]; then
+    if [ -n "$(find "$marker" -mmin +10 2>/dev/null)" ]; then
+      [[ "$HATCH_HOOK_DRY_RUN" != "1" ]] && rm -f "$marker"
+    else
+      continue
+    fi
+  fi
+  [[ "$HATCH_HOOK_DRY_RUN" != "1" ]] && touch "$marker"
+  new=$((new + 1))
+done
+if [[ "$HATCH_HOOK_DRY_RUN" != "1" ]]; then
+  for m in "$WOKEN_DIR"/*; do
+    [ -e "$m" ] || continue
+    mid=$(basename "$m")
+    if ! ls "$BRIDGE/inbox"/*-"$mid".json >/dev/null 2>&1; then
+      rm -f "$m"
+    fi
+  done
+fi
+if [ "$new" -gt 0 ]; then
+  wake "微信有 $new 条新消息" "{\"count\": $new}"
 fi
 
 # Session expired: only a rescan fixes it — wake the agent to tell Richard.
